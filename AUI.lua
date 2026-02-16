@@ -670,6 +670,9 @@ local Agent = {
 	-- Respawn handling
 	RespawnBufferTime = 0,
 	LastDeadTime = 0,
+	RespawnYPos = nil,
+	RespawnYStable = false,
+	RespawnYCheckTime = 0,
 
 	-- Tracking for fitness
 	PreviousKills = 0,
@@ -707,6 +710,11 @@ function Agent.CheckGameState()
 
 	if pGui and pGui:FindFirstChild("Menu") then
 		local menuMain = pGui.Menu:FindFirstChild("MenuMain")
+		-- Don't open menus or change team/class while we're in the respawn buffer
+		if Agent.RespawnBufferTime and Agent.RespawnBufferTime > 0 then
+			return
+		end
+
 		if
 			(not statusTeam or statusTeam == "" or statusTeam == "Neutral") and (not menuMain or not menuMain.Visible)
 		then
@@ -736,10 +744,11 @@ function Agent.CheckGameState()
 						end
 					end
 				else
+					-- If player is spectator (or already has a team), try picking a class via number keys
 					local key = NumberMap[math.random(1, 9)]
 					if key then
 						Services.VIM:SendKeyEvent(true, key, false, game)
-						task.wait(0.1)
+						task.wait(0.08)
 						Services.VIM:SendKeyEvent(false, key, false, game)
 					end
 				end
@@ -1116,6 +1125,29 @@ function UI.Init()
 		script:Destroy()
 	end)
 
+	-- INTERPRET ALL RECORDINGS BUTTON
+	local interpretBtn = Instance.new("TextButton", main)
+	interpretBtn.Size = UDim2.new(1, 0, 0, 25)
+	interpretBtn.BackgroundColor3 = Color3.fromRGB(100, 150, 200)
+	interpretBtn.Text = "INTERPRET ALL RECORDINGS"
+	interpretBtn.TextColor3 = Color3.new(1, 1, 1)
+	interpretBtn.Font = Enum.Font.SourceSansBold
+	interpretBtn.LayoutOrder = 11
+	Instance.new("UICorner", interpretBtn)
+	UI.InterpretStatus = AddLabel("Recordings: 0 loaded", Color3.fromRGB(200, 200, 100), 12)
+	interpretBtn.MouseButton1Click:Connect(function()
+		local result = Agent.InterpretAllRecordings()
+		if result and result.totalFrames then
+			UI.InterpretStatus.Text = "Recordings: "
+				.. result.recordingCount
+				.. " loaded, "
+				.. result.totalFrames
+				.. " frames"
+		else
+			UI.InterpretStatus.Text = "Recordings: Error or no files found"
+		end
+	end)
+
 	-- DEBUG RIGHT PANEL
 	local debugPanel = Instance.new("Frame", sg)
 	debugPanel.Name = "DebugPanel"
@@ -1161,60 +1193,8 @@ function UI.Init()
 	UI.DebugBoredom = AddDebugLabel("Boredom: 0.00", Color3.fromRGB(255, 150, 150), 9)
 	UI.DebugFitness = AddDebugLabel("RunFit: 0", Color3.fromRGB(255, 200, 100), 10)
 
-	-- NEURAL NETWORK VISUALIZATION BUTTON (TOP CENTER)
-	local brainButton = Instance.new("TextButton", sg)
-	brainButton.Name = "BrainButton"
-	brainButton.Size = UDim2.new(0, 120, 0, 30)
-	brainButton.Position = UDim2.new(0.5, 0, 0.02, 0)
-	brainButton.AnchorPoint = Vector2.new(0.5, 0)
-	brainButton.BackgroundColor3 = Color3.fromRGB(50, 100, 200)
-	brainButton.TextColor3 = Color3.new(1, 1, 1)
-	brainButton.Text = "BRAIN NEURAL MAP"
-	brainButton.Font = Enum.Font.GothamBold
-	brainButton.TextSize = 11
-	Instance.new("UICorner", brainButton).CornerRadius = UDim.new(0, 5)
-
-	UI.BrainVisualActive = false
-	brainButton.MouseButton1Click:Connect(function()
-		UI.BrainVisualActive = not UI.BrainVisualActive
-		brainButton.BackgroundColor3 = UI.BrainVisualActive and Color3.fromRGB(100, 200, 50)
-			or Color3.fromRGB(50, 100, 200)
-		-- Immediately update canvas visibility
-		if UI.BrainVisualActive then
-			UI.DrawNeuralNetwork(Agent)
-		else
-			UI.BrainCanvas.Visible = false
-		end
-	end)
-
-	-- NEURAL NETWORK CANVAS
-	local brainCanvas = Instance.new("Frame", sg)
-	brainCanvas.Name = "BrainCanvas"
-	brainCanvas.Size = UDim2.new(0, 600, 0, 400)
-	brainCanvas.Position = UDim2.new(0.5, 0, 0.08, 0)
-	brainCanvas.AnchorPoint = Vector2.new(0.5, 0)
-	brainCanvas.BackgroundColor3 = Color3.fromRGB(10, 10, 15)
-	brainCanvas.BorderColor3 = Color3.fromRGB(100, 200, 255)
-	brainCanvas.BorderSizePixel = 2
-	brainCanvas.Visible = false
-	brainCanvas.ZIndex = 100
-
-	local closeCanvasBtn = Instance.new("TextButton", brainCanvas)
-	closeCanvasBtn.Name = "CloseBtn"
-	closeCanvasBtn.Size = UDim2.new(0, 30, 0, 30)
-	closeCanvasBtn.Position = UDim2.new(1, -35, 0, 5)
-	closeCanvasBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
-	closeCanvasBtn.Text = "✕"
-	closeCanvasBtn.Font = Enum.Font.GothamBold
-	closeCanvasBtn.TextColor3 = Color3.new(1, 1, 1)
-	closeCanvasBtn.MouseButton1Click:Connect(function()
-		brainCanvas.Visible = false
-		UI.BrainVisualActive = false
-		brainButton.BackgroundColor3 = Color3.fromRGB(50, 100, 200)
-	end)
-
-	UI.BrainCanvas = brainCanvas
-	UI.BrainButton = brainButton
+	-- Brain visualization removed for performance reasons
+	AddLabel("BRAIN UI: Disabled (removed for performance)", Color3.fromRGB(200, 120, 120), 99)
 end
 
 function UI.UpdateDebug(agent)
@@ -1251,107 +1231,9 @@ function UI.UpdateDebug(agent)
 end
 
 function UI.DrawNeuralNetwork(agent)
-	if not agent or not agent.CurrentBrain then
-		return
-	end
-
-	local canvas = UI.BrainCanvas
-
-	-- Only show if active
-	if not UI.BrainVisualActive then
-		canvas.Visible = false
-		return
-	end
-
-	canvas.Visible = true
-
-	-- Clear previous drawings (preserve close button)
-	for _, child in ipairs(canvas:GetChildren()) do
-		if child.Name ~= "CloseBtn" then
-			child:Destroy()
-		end
-	end
-
-	local topology = Config.Topology
-	local padding = 50
-	local canvasWidth = canvas.Size.X.Offset
-	local canvasHeight = canvas.Size.Y.Offset - 50
-	local layerSpacing = (canvasWidth - 2 * padding) / (#topology - 1)
-	local maxNeurons = math.max(unpack(topology))
-
-	-- Draw title
-	local titleLabel = Instance.new("TextLabel", canvas)
-	titleLabel.Size = UDim2.new(1, 0, 0, 30)
-	titleLabel.Position = UDim2.new(0, 0, 0, 5)
-	titleLabel.BackgroundTransparency = 1
-	titleLabel.Text = "Neural Network Architecture (Gen " .. agent.CurrentBrain.Generation .. ")"
-	titleLabel.Font = Enum.Font.GothamBold
-	titleLabel.TextColor3 = Color3.fromRGB(100, 200, 255)
-	titleLabel.TextSize = 14
-
-	-- Draw layers and neurons
-	local neuronPositions = {}
-
-	for layerIdx, neuronCount in ipairs(topology) do
-		neuronPositions[layerIdx] = {}
-
-		local x = padding + (layerIdx - 1) * layerSpacing
-		local verticalSpacing = (canvasHeight - 20) / (neuronCount + 1)
-
-		-- Layer label
-		local layerLabel = Instance.new("TextLabel", canvas)
-		layerLabel.Size = UDim2.new(0, 80, 0, 20)
-		layerLabel.Position = UDim2.new(0, x - 40, 1, -25)
-		layerLabel.BackgroundTransparency = 1
-		layerLabel.Text = "L" .. layerIdx .. "(" .. neuronCount .. ")"
-		layerLabel.Font = Enum.Font.RobotoMono
-		layerLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
-		layerLabel.TextSize = 9
-
-		for neuronIdx = 1, neuronCount do
-			local y = 40 + (neuronIdx - 0.5) * (canvasHeight - 60) / neuronCount
-
-			-- Draw neuron circle
-			local neuron = Instance.new("Frame", canvas)
-			neuron.Size = UDim2.new(0, 12, 0, 12)
-			neuron.Position = UDim2.new(0, x - 6, 0, y - 6)
-			neuron.BackgroundColor3 = Color3.fromRGB(100, 200, 255)
-			neuron.BorderSizePixel = 1
-			neuron.BorderColor3 = Color3.fromRGB(200, 220, 255)
-			Instance.new("UICorner", neuron).CornerRadius = UDim.new(1, 0)
-
-			neuronPositions[layerIdx][neuronIdx] = { x = x, y = y }
-		end
-
-		-- Draw connections to next layer
-		if layerIdx < #topology then
-			local nextLayerIdx = layerIdx + 1
-			local nextNeuronCount = topology[nextLayerIdx]
-
-			for neuronIdx = 1, neuronCount do
-				local fromX = neuronPositions[layerIdx][neuronIdx].x
-				local fromY = neuronPositions[layerIdx][neuronIdx].y
-
-				for nextNeuronIdx = 1, math.min(nextNeuronCount, 3) do
-					local toX = padding + layerIdx * layerSpacing
-					local toY = 40 + (nextNeuronIdx - 0.5) * (canvasHeight - 60) / nextNeuronCount
-
-					local line = Instance.new("Frame", canvas)
-					local dx = toX - fromX
-					local dy = toY - fromY
-					local dist = math.sqrt(dx * dx + dy * dy)
-					local angle = math.atan2(dy, dx)
-
-					line.Size = UDim2.new(0, dist, 0, 1)
-					line.Position = UDim2.new(0, fromX, 0, fromY)
-					line.BackgroundColor3 = Color3.fromRGB(80, 120, 180)
-					line.BorderSizePixel = 0
-					line.Rotation = math.deg(angle)
-					line.AnchorPoint = Vector2.new(0, 0.5)
-				end
-			end
-		end
-	end
+	-- Disabled: heavy neural UI removed to improve performance.
+	-- Stub kept so calls remain safe.
+	return
 end
 
 function Agent.SaveBrain()
@@ -1383,6 +1265,130 @@ function Agent.LoadBrain()
 	else
 		UI.Status.Text = "STATUS: NEW BRAIN CREATED"
 	end
+end
+
+-- Interpreter: convert recorded gameplay JSON into input vectors compatible with the agent
+function Agent.InterpretRecordingFromFile(filename)
+	if not filename or not isfile or not isfile(filename) then
+		return nil, "file_missing"
+	end
+	local ok, raw = pcall(function()
+		return Services.Http:JSONDecode(readfile(filename))
+	end)
+	if not ok or not raw then
+		return nil, "decode_failed"
+	end
+
+	local frames = raw.frames or {}
+	local dataset = {}
+
+	for _, f in ipairs(frames) do
+		local inputs = {}
+		-- menuOpen (recorded boolean)
+		table.insert(inputs, (f.menuOpen and 1) or 0)
+
+		-- health ratio
+		local health = f.health or 0
+		local maxHealth = f.maxHealth or 100
+		table.insert(inputs, math.clamp(health / maxHealth, 0, 1))
+
+		-- walk speed normalized (assume 30 max)
+		table.insert(inputs, (f.walkSpeed or 0) / 30)
+
+		-- Y position normalized
+		table.insert(inputs, math.clamp((f.position and f.position.y or 0) / 100, -1, 1))
+
+		-- ray distances (angles) - expect array of distances normalized to 60
+		local rays = f.rays or {}
+		for i = 1, 9 do
+			local d = rays[i] or 60
+			table.insert(inputs, (d and (d / 60)) or 1)
+		end
+
+		-- enemy vector placeholders (not available in recording unless enemy pos logged)
+		table.insert(inputs, 0)
+		table.insert(inputs, 0)
+		table.insert(inputs, 0)
+		table.insert(inputs, 1) -- distance placeholder
+		table.insert(inputs, -1)
+
+		-- danger and danger dir
+		table.insert(inputs, f.danger or 0)
+		table.insert(inputs, (f.dangerDir and f.dangerDir.x) or 0)
+		table.insert(inputs, (f.dangerDir and f.dangerDir.y) or 0)
+
+		-- sliding door scan
+		table.insert(inputs, f.doorScan or -1)
+
+		-- floor material airborne flag
+		table.insert(inputs, (f.isAir and 1) or -1)
+
+		-- class and weapon numeric values (if recorded)
+		table.insert(inputs, f.classVal or 0)
+		table.insert(inputs, f.weaponVal or 0)
+
+		-- memory recurrence (pad zeros)
+		for i = 1, 12 do
+			table.insert(inputs, 0)
+		end
+
+		-- inSpawn (recorded)
+		table.insert(inputs, (f.inSpawn and 1) or -1)
+		table.insert(inputs, math.min((f.boredom or 0) / (Config.Hyperparameters.BoredomThreshold or 25), 1))
+
+		-- pad to match topology input size
+		while #inputs < Config.Topology[1] do
+			table.insert(inputs, 0)
+		end
+
+		table.insert(dataset, inputs)
+	end
+
+	return dataset
+end
+
+-- Scan for all gameplay_*.json files and interpret them into a combined dataset
+function Agent.InterpretAllRecordings()
+	local totalDataset = {}
+	local recordingCount = 0
+
+	-- List all files in the workspace directory and filter for gameplay_*.json
+	-- Since Roblox Lua has limited file enumeration, we'll check common gameplay files
+	for i = 1, 1000 do
+		local possibleFilename = "gameplay_" .. i .. ".json"
+		if isfile(possibleFilename) then
+			local dataset, err = Agent.InterpretRecordingFromFile(possibleFilename)
+			if dataset then
+				for _, frame in ipairs(dataset) do
+					table.insert(totalDataset, frame)
+				end
+				recordingCount = recordingCount + 1
+			end
+		end
+	end
+
+	-- Also try with timestamp-based filenames (os.time() format)
+	-- For efficiency, we'll check recent timestamps
+	local currentTime = os.time()
+	for offset = 0, 86400 * 7 do -- scan last 7 days
+		local checkTime = currentTime - offset
+		local possibleFilename = "gameplay_" .. checkTime .. ".json"
+		if isfile(possibleFilename) then
+			local dataset, err = Agent.InterpretRecordingFromFile(possibleFilename)
+			if dataset and not table.find(totalDataset, dataset[1]) then
+				for _, frame in ipairs(dataset) do
+					table.insert(totalDataset, frame)
+				end
+				recordingCount = recordingCount + 1
+			end
+		end
+	end
+
+	return {
+		recordingCount = recordingCount,
+		totalFrames = #totalDataset,
+		dataset = totalDataset,
+	}
 end
 
 function Agent.Init()
@@ -1515,26 +1521,56 @@ function Agent.Init()
 			local char = LocalPlayer.Character
 			if char and char:FindFirstChild("HumanoidRootPart") then
 				local root = char.HumanoidRootPart
-				
-				-- On first respawn frame (>1.4s left), verify and position at spawn zone
-				if Agent.RespawnBufferTime > 1.4 then
-					-- Check if player is in correct respawn zone
+				local currentY = root.Position.Y
+
+				-- Track initial Y position on first respawn frame
+				if Agent.RespawnYPos == nil then
+					Agent.RespawnYPos = currentY
+					Agent.RespawnYCheckTime = 0
+					Agent.RespawnYStable = false
+				end
+
+				-- Detect if server is teleporting player (Y changes drastically, e.g., < -1000)
+				if currentY < -1000 then
+					-- Server teleport detected; suppress repositioning and wait for stabilization
+					root.AssemblyLinearVelocity = root.AssemblyLinearVelocity * 0.3
+					return
+				end
+
+				-- Check for Y stabilization (same position for ~0.5 seconds = reasonably stable)
+				Agent.RespawnYCheckTime = Agent.RespawnYCheckTime + dt
+				if math.abs(currentY - Agent.RespawnYPos) < 2 then
+					if Agent.RespawnYCheckTime > 0.5 then
+						Agent.RespawnYStable = true
+					end
+				else
+					Agent.RespawnYPos = currentY
+					Agent.RespawnYCheckTime = 0
+				end
+
+				-- Once Y is stable and respawn buffer still active, reposition to spawn zone if not already there
+				if Agent.RespawnYStable and Agent.RespawnBufferTime > 0.5 then
 					local inRespawnZone, respawnTeam = Perception.IsInRespawnZone()
 					if not inRespawnZone then
-						-- If not in spawn zone, find nearest and position there
 						local spawnPart, spawnTeam = Perception.FindNearestSpawnZone()
 						if spawnPart then
 							local spawnPos = spawnPart.Position + Vector3.new(0, spawnPart.Size.Y / 2 + 3, 0)
 							root.CFrame = CFrame.new(spawnPos)
 						end
 					end
+					Agent.RespawnYStable = false -- Reset after one reposition attempt
 				end
-				
+
 				-- Clamp velocity to prevent flinging
 				root.AssemblyLinearVelocity = root.AssemblyLinearVelocity * 0.5
 			end
 			return
 		end
+
+		-- Reset respawn tracking on next alive frame
+		Agent.RespawnYPos = nil
+		Agent.RespawnYStable = false
+		Agent.RespawnYCheckTime = 0
 
 		-- Now it's safe to run game logic
 		Agent.CheckGameState()
@@ -1574,7 +1610,6 @@ function Agent.Init()
 
 			-- Update debug UI
 			UI.UpdateDebug(Agent)
-			UI.DrawNeuralNetwork(Agent)
 		end
 	end)
 end
