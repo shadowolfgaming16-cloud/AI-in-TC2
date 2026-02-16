@@ -427,7 +427,7 @@ function Perception.IsInSpawnZone()
 	local function checkZone(z)
 		local zone = ignore:FindFirstChild(z)
 		if zone then
-			for _, part in ipairs(zone:GetDescendants()) do
+			for _, part in ipairs(zone:GetChildren()) do
 				if part:IsA("BasePart") then
 					local localPos = part.CFrame:PointToObjectSpace(myPos)
 					if
@@ -450,6 +450,111 @@ function Perception.IsInSpawnZone()
 		return true, "Red"
 	end
 	return false, nil
+end
+
+function Perception.IsInRespawnZone()
+	-- Used to verify correct respawn using TRCSpawns/TGCSpawns
+	local char = LocalPlayer.Character
+	if not char then
+		return false
+	end
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return false
+	end
+
+	local map = Services.Workspace:FindFirstChild("Map")
+	if not map then
+		return false
+	end
+
+	local myPos = root.Position
+
+	-- Check TRC Spawns (Red Team)
+	local trcSpawns = map:FindFirstChild("TRCSpawns")
+	if trcSpawns then
+		for _, part in ipairs(trcSpawns:GetChildren()) do
+			if part:IsA("BasePart") then
+				local localPos = part.CFrame:PointToObjectSpace(myPos)
+				if
+					math.abs(localPos.X) <= part.Size.X / 2
+					and math.abs(localPos.Y) <= part.Size.Y / 2
+					and math.abs(localPos.Z) <= part.Size.Z / 2
+				then
+					return true, "Red"
+				end
+			end
+		end
+	end
+
+	-- Check TGC Spawns (Green Team)
+	local tgcSpawns = map:FindFirstChild("TGCSpawns")
+	if tgcSpawns then
+		for _, part in ipairs(tgcSpawns:GetChildren()) do
+			if part:IsA("BasePart") then
+				local localPos = part.CFrame:PointToObjectSpace(myPos)
+				if
+					math.abs(localPos.X) <= part.Size.X / 2
+					and math.abs(localPos.Y) <= part.Size.Y / 2
+					and math.abs(localPos.Z) <= part.Size.Z / 2
+				then
+					return true, "Green"
+				end
+			end
+		end
+	end
+
+	return false, nil
+end
+
+function Perception.FindNearestSpawnZone()
+	local char = LocalPlayer.Character
+	if not char or not char:FindFirstChild("HumanoidRootPart") then
+		return nil
+	end
+
+	local map = Services.Workspace:FindFirstChild("Map")
+	if not map then
+		return nil
+	end
+
+	local root = char.HumanoidRootPart
+	local myPos = root.Position
+	local nearestPart = nil
+	local nearestDist = math.huge
+	local spawnTeam = nil
+
+	-- Check TRC Spawns first
+	local trcSpawns = map:FindFirstChild("TRCSpawns")
+	if trcSpawns then
+		for _, part in ipairs(trcSpawns:GetChildren()) do
+			if part:IsA("BasePart") then
+				local dist = (part.Position - myPos).Magnitude
+				if dist < nearestDist then
+					nearestDist = dist
+					nearestPart = part
+					spawnTeam = "Red"
+				end
+			end
+		end
+	end
+
+	-- Check TGC Spawns
+	local tgcSpawns = map:FindFirstChild("TGCSpawns")
+	if tgcSpawns then
+		for _, part in ipairs(tgcSpawns:GetChildren()) do
+			if part:IsA("BasePart") then
+				local dist = (part.Position - myPos).Magnitude
+				if dist < nearestDist then
+					nearestDist = dist
+					nearestPart = part
+					spawnTeam = "Green"
+				end
+			end
+		end
+	end
+
+	return nearestPart, spawnTeam
 end
 
 function Perception.GetInputs(agent)
@@ -555,6 +660,21 @@ local Agent = {
 
 	LastCameraYaw = 0,
 	LastCameraPitch = 0,
+
+	-- Improved targeting
+	TargetingYaw = 0,
+	TargetingPitch = 0,
+	AimConfidence = 0,
+	EnemyVelocity = Vector3.zero,
+
+	-- Respawn handling
+	RespawnBufferTime = 0,
+	LastDeadTime = 0,
+
+	-- Tracking for fitness
+	PreviousKills = 0,
+	PreviousDamage = 0,
+	LastAimTime = 0,
 }
 
 function Agent.CheckDeadStatus()
@@ -563,13 +683,6 @@ function Agent.CheckDeadStatus()
 		local deadVal = playerModel:FindFirstChild("Dead")
 		if deadVal and deadVal:IsA("BoolValue") then
 			return deadVal.Value
-		end
-	end
-	local char = LocalPlayer.Character
-	if char then
-		local hum = char:FindFirstChild("Humanoid")
-		if hum and hum.Health <= 0 then
-			return true
 		end
 	end
 	return false
@@ -644,6 +757,18 @@ function Agent.Execute(rawOutputs, dt)
 		return
 	end
 
+	-- Respawn buffer: don't move for 1.5 seconds after respawning
+	if Agent.RespawnBufferTime > 0 then
+		Agent.RespawnBufferTime = Agent.RespawnBufferTime - dt
+		-- Release all movement keys during respawn
+		Services.VIM:SendKeyEvent(false, Enum.KeyCode.W, false, game)
+		Services.VIM:SendKeyEvent(false, Enum.KeyCode.S, false, game)
+		Services.VIM:SendKeyEvent(false, Enum.KeyCode.A, false, game)
+		Services.VIM:SendKeyEvent(false, Enum.KeyCode.D, false, game)
+		Services.VIM:SendKeyEvent(false, Enum.KeyCode.LeftControl, false, game)
+		return
+	end
+
 	local doorState = Perception.ScanSlidingDoors()
 	local doorStuck = (Perception.DoorWaitTime or 0) > 3.0
 
@@ -683,50 +808,41 @@ function Agent.Execute(rawOutputs, dt)
 	end
 	Services.VIM:SendKeyEvent(out[12] > 0.5, Enum.KeyCode.LeftControl, false, game)
 
-	local sensitivity = 1.5
-	local yaw = -out[4] * sensitivity
-	local pitch = out[5] * sensitivity
-	if math.abs(yaw) < 0.5 then
-		yaw = 0
+	-- Improved: Smart targeting system (used for fitness reward, not camera control)
+	local hasTarget = false
+
+	if Perception.CachedEnemy then
+		hasTarget = true
+		local myRoot = char.HumanoidRootPart
+		local enemyPos = Perception.CachedEnemy.Position
+		local dirToEnemy = (enemyPos - myRoot.Position)
+		local distToEnemy = dirToEnemy.Magnitude
+
+		-- Predictive aiming: account for enemy movement
+		if Agent.EnemyVelocity then
+			local predictionTime = distToEnemy / 100 -- Estimated projectile travel time
+			local predictedPos = enemyPos + (Agent.EnemyVelocity * predictionTime * 0.3)
+			dirToEnemy = (predictedPos - myRoot.Position)
+		end
+
+		dirToEnemy = dirToEnemy.Unit
+		local myLook = myRoot.CFrame.LookVector
+
+		-- Calculate aiming confidence (for fitness tracking, not camera control)
+		local lookDot = myLook:Dot(dirToEnemy)
+		Agent.AimConfidence = math.clamp((lookDot - 0.5) * 2, 0, 1)
 	end
-	if math.abs(pitch) < 0.5 then
-		pitch = 0
-	end
-	yaw = math.clamp(yaw, -5, 5)
-	pitch = math.clamp(pitch, -5, 5)
 
-	local currentCF = Camera.CFrame
-	Agent.LastCameraYaw = Math.Lerp(Agent.LastCameraYaw or 0, math.rad(yaw), 0.3)
-	Agent.LastCameraPitch = Math.Lerp(Agent.LastCameraPitch or 0, math.rad(pitch), 0.3)
-
-	local newCF = currentCF * CFrame.Angles(0, Agent.LastCameraYaw, 0) * CFrame.Angles(Agent.LastCameraPitch, 0, 0)
-	local rx, ry, rz = newCF:ToOrientation()
-	rx = math.clamp(rx, math.rad(-80), math.rad(80))
-	Camera.CFrame = CFrame.new(newCF.Position) * CFrame.fromOrientation(rx, ry, rz)
-
-	if out[6] > 0.5 and tick() - Agent.LastShot > 0.1 then
+	-- Shooting control based on neural network
+	if Perception.CachedEnemy and out[6] > 0.3 and tick() - Agent.LastShot > 0.15 then
 		Agent.LastShot = tick()
 		local mLoc = Services.UIS:GetMouseLocation()
 		Services.VIM:SendMouseButtonEvent(mLoc.X, mLoc.Y, 0, true, game, 1)
-		task.delay(0.05, function()
+		task.delay(0.08, function()
 			Services.VIM:SendMouseButtonEvent(mLoc.X, mLoc.Y, 0, false, game, 1)
 		end)
 
-		local isAimingAtEnemy = false
-		if Perception.CachedEnemy then
-			local look = char.HumanoidRootPart.CFrame.LookVector
-			local dirToEnemy = (Perception.CachedEnemy.Position - char.HumanoidRootPart.Position).Unit
-			if look:Dot(dirToEnemy) > 0.6 then
-				isAimingAtEnemy = true
-			end
-		end
-
-		if isAimingAtEnemy then
-			Agent.BoredomLevel = math.max(0, Agent.BoredomLevel - 1.5)
-			Agent.CurrentRunFitness = Agent.CurrentRunFitness + 1.0
-		else
-			Agent.CurrentRunFitness = Agent.CurrentRunFitness + 0.1
-		end
+		Agent.BoredomLevel = math.max(0, Agent.BoredomLevel - 2.0)
 	end
 
 	if out[7] > 0.7 then
@@ -842,23 +958,69 @@ function Agent.UpdateFitness(dt)
 	end
 
 	if enemy then
+		-- Track enemy velocity for predictive aiming
+		local newVelocity = (enemy.Position - Agent.LastPos)
+		Agent.EnemyVelocity = Math.Lerp(Agent.EnemyVelocity or Vector3.zero, newVelocity, 0.3)
+
 		local distDelta = Agent.LastEnemyDist - dist
 		if distDelta > 0 then
-			Agent.CurrentRunFitness = Agent.CurrentRunFitness + (distDelta * 0.2)
+			Agent.CurrentRunFitness = Agent.CurrentRunFitness + (distDelta * 0.3)
 		end
 		local look = root.CFrame.LookVector
 		local dirToEnemy = (enemy.Position - root.Position).Unit
 		local facing = look:Dot(dirToEnemy)
-		if facing > 0.8 then
+
+		-- Reward good aim and aiming confidence
+		if Agent.AimConfidence > 0.7 then
+			Agent.CurrentRunFitness = Agent.CurrentRunFitness + (0.5 * dt)
+		elseif Agent.AimConfidence > 0.5 then
 			Agent.CurrentRunFitness = Agent.CurrentRunFitness + (0.2 * dt)
 		end
+
+		if facing > 0.8 then
+			Agent.CurrentRunFitness = Agent.CurrentRunFitness + (0.4 * dt)
+		end
+		if facing > 0.6 then
+			Agent.CurrentRunFitness = Agent.CurrentRunFitness + (0.15 * dt)
+		end
+		-- Reward getting closer to enemies
+		if dist < 50 then
+			Agent.CurrentRunFitness = Agent.CurrentRunFitness + (0.5 * dt)
+		end
+
 		Agent.LastEnemyDist = dist
 	else
-		Agent.CurrentRunFitness = Agent.CurrentRunFitness - (0.02 * dt)
+		Agent.CurrentRunFitness = Agent.CurrentRunFitness - (0.05 * dt)
+		Agent.AimConfidence = 0
+	end
+
+	-- Track kills and damage from CurrentLifeStats
+	local stats = LocalPlayer:FindFirstChild("CurrentLifeStats")
+	if stats then
+		local killsVal = stats:FindFirstChild("Kills")
+		local damageVal = stats:FindFirstChild("Damage")
+
+		if killsVal and killsVal:IsA("NumberValue") then
+			local currentKills = killsVal.Value
+			if currentKills > Agent.PreviousKills then
+				local killDelta = currentKills - Agent.PreviousKills
+				Agent.CurrentRunFitness = Agent.CurrentRunFitness + (killDelta * 50) -- Major reward for each kill
+			end
+			Agent.PreviousKills = currentKills
+		end
+
+		if damageVal and damageVal:IsA("NumberValue") then
+			local currentDamage = damageVal.Value
+			if currentDamage > Agent.PreviousDamage then
+				local damageDelta = currentDamage - Agent.PreviousDamage
+				Agent.CurrentRunFitness = Agent.CurrentRunFitness + (damageDelta * 0.5) -- Smaller reward for damage
+			end
+			Agent.PreviousDamage = currentDamage
+		end
 	end
 
 	if hum.Health < Agent.PreviousHealth then
-		Agent.CurrentRunFitness = Agent.CurrentRunFitness - 2
+		Agent.CurrentRunFitness = Agent.CurrentRunFitness - 3
 	end
 	Agent.PreviousHealth = hum.Health
 	Agent.LastPos = root.Position
@@ -876,6 +1038,7 @@ function UI.Init()
 	sg.DisplayOrder = 10
 	sg.Parent = (Services.CoreGui:FindFirstChild("RobloxGui") and Services.CoreGui) or LocalPlayer.PlayerGui
 
+	-- MAIN LEFT PANEL
 	local main = Instance.new("Frame", sg)
 	main.Name = "MainFrame"
 	main.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
@@ -952,6 +1115,243 @@ function UI.Init()
 		sg:Destroy()
 		script:Destroy()
 	end)
+
+	-- DEBUG RIGHT PANEL
+	local debugPanel = Instance.new("Frame", sg)
+	debugPanel.Name = "DebugPanel"
+	debugPanel.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+	debugPanel.Position = UDim2.new(0.98, 0, 0.5, 0)
+	debugPanel.Size = UDim2.new(0, 320, 0, 0)
+	debugPanel.AutomaticSize = Enum.AutomaticSize.Y
+	debugPanel.BorderSizePixel = 0
+	debugPanel.AnchorPoint = Vector2.new(1, 0)
+
+	local debugPad = Instance.new("UIPadding", debugPanel)
+	debugPad.PaddingTop = UDim.new(0, 10)
+	debugPad.PaddingBottom = UDim.new(0, 10)
+	debugPad.PaddingLeft = UDim.new(0, 10)
+	debugPad.PaddingRight = UDim.new(0, 10)
+	local debugLayout = Instance.new("UIListLayout", debugPanel)
+	debugLayout.Padding = UDim.new(0, 2)
+	debugLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+	local function AddDebugLabel(text, color, order)
+		local l = Instance.new("TextLabel", debugPanel)
+		l.BackgroundTransparency = 1
+		l.Size = UDim2.new(1, 0, 0, 14)
+		l.Font = Enum.Font.RobotoMono
+		l.Text = text
+		l.TextColor3 = color or Color3.new(0.8, 0.8, 0.8)
+		l.TextXAlignment = Enum.TextXAlignment.Left
+		l.LayoutOrder = order
+		l.RichText = true
+		l.TextSize = 11
+		return l
+	end
+
+	AddDebugLabel("<b>== DEBUG INFO ==</b>", Color3.fromRGB(100, 200, 255), 0)
+	UI.DebugDead = AddDebugLabel("Dead: false", Color3.fromRGB(100, 255, 100), 1)
+	UI.DebugRespawnBuffer = AddDebugLabel("RespawnBuf: 0.0s", Color3.fromRGB(255, 200, 100), 2)
+	UI.DebugPosition = AddDebugLabel("Pos: (0, 0, 0)", Color3.fromRGB(150, 200, 255), 3)
+	UI.DebugInSpawn = AddDebugLabel("InSpawn: false", Color3.fromRGB(100, 255, 100), 4)
+	UI.DebugCharExists = AddDebugLabel("Char: ✗", Color3.fromRGB(255, 100, 100), 5)
+	UI.DebugEnemy = AddDebugLabel("Enemy: None", Color3.fromRGB(255, 150, 150), 6)
+	UI.DebugDist = AddDebugLabel("Dist: 999", Color3.fromRGB(200, 200, 100), 7)
+	UI.DebugAim = AddDebugLabel("AimConf: 0.00", Color3.fromRGB(150, 255, 150), 8)
+	UI.DebugBoredom = AddDebugLabel("Boredom: 0.00", Color3.fromRGB(255, 150, 150), 9)
+	UI.DebugFitness = AddDebugLabel("RunFit: 0", Color3.fromRGB(255, 200, 100), 10)
+
+	-- NEURAL NETWORK VISUALIZATION BUTTON (TOP CENTER)
+	local brainButton = Instance.new("TextButton", sg)
+	brainButton.Name = "BrainButton"
+	brainButton.Size = UDim2.new(0, 120, 0, 30)
+	brainButton.Position = UDim2.new(0.5, 0, 0.02, 0)
+	brainButton.AnchorPoint = Vector2.new(0.5, 0)
+	brainButton.BackgroundColor3 = Color3.fromRGB(50, 100, 200)
+	brainButton.TextColor3 = Color3.new(1, 1, 1)
+	brainButton.Text = "BRAIN NEURAL MAP"
+	brainButton.Font = Enum.Font.GothamBold
+	brainButton.TextSize = 11
+	Instance.new("UICorner", brainButton).CornerRadius = UDim.new(0, 5)
+
+	UI.BrainVisualActive = false
+	brainButton.MouseButton1Click:Connect(function()
+		UI.BrainVisualActive = not UI.BrainVisualActive
+		brainButton.BackgroundColor3 = UI.BrainVisualActive and Color3.fromRGB(100, 200, 50)
+			or Color3.fromRGB(50, 100, 200)
+		-- Immediately update canvas visibility
+		if UI.BrainVisualActive then
+			UI.DrawNeuralNetwork(Agent)
+		else
+			UI.BrainCanvas.Visible = false
+		end
+	end)
+
+	-- NEURAL NETWORK CANVAS
+	local brainCanvas = Instance.new("Frame", sg)
+	brainCanvas.Name = "BrainCanvas"
+	brainCanvas.Size = UDim2.new(0, 600, 0, 400)
+	brainCanvas.Position = UDim2.new(0.5, 0, 0.08, 0)
+	brainCanvas.AnchorPoint = Vector2.new(0.5, 0)
+	brainCanvas.BackgroundColor3 = Color3.fromRGB(10, 10, 15)
+	brainCanvas.BorderColor3 = Color3.fromRGB(100, 200, 255)
+	brainCanvas.BorderSizePixel = 2
+	brainCanvas.Visible = false
+	brainCanvas.ZIndex = 100
+
+	local closeCanvasBtn = Instance.new("TextButton", brainCanvas)
+	closeCanvasBtn.Name = "CloseBtn"
+	closeCanvasBtn.Size = UDim2.new(0, 30, 0, 30)
+	closeCanvasBtn.Position = UDim2.new(1, -35, 0, 5)
+	closeCanvasBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+	closeCanvasBtn.Text = "✕"
+	closeCanvasBtn.Font = Enum.Font.GothamBold
+	closeCanvasBtn.TextColor3 = Color3.new(1, 1, 1)
+	closeCanvasBtn.MouseButton1Click:Connect(function()
+		brainCanvas.Visible = false
+		UI.BrainVisualActive = false
+		brainButton.BackgroundColor3 = Color3.fromRGB(50, 100, 200)
+	end)
+
+	UI.BrainCanvas = brainCanvas
+	UI.BrainButton = brainButton
+end
+
+function UI.UpdateDebug(agent)
+	if not UI.DebugDead then
+		return
+	end
+
+	local char = LocalPlayer.Character
+	local charExists = char ~= nil
+	local inSpawn, zone = Perception.IsInSpawnZone()
+	local pos = charExists and char:FindFirstChild("HumanoidRootPart") and char.HumanoidRootPart.Position
+		or Vector3.zero
+
+	UI.DebugDead.Text = "Dead: "
+		.. (
+			Agent.IsDead and "<b><font color='rgb(255,100,100)'>TRUE</font></b>"
+			or "<b><font color='rgb(100,255,100)'>false</font></b>"
+		)
+	UI.DebugRespawnBuffer.Text = string.format("RespawnBuf: %.2fs", Agent.RespawnBufferTime)
+	UI.DebugPosition.Text = string.format("Pos: (%.0f, %.0f, %.0f)", pos.X, pos.Y, pos.Z)
+	UI.DebugInSpawn.Text = "InSpawn: "
+		.. (
+			inSpawn and "<b><font color='rgb(100,255,100)'>YES</font></b> (" .. (zone or "?") .. ")"
+			or "<b><font color='rgb(255,100,100)'>NO</font></b>"
+		)
+	UI.DebugCharExists.Text = "Char: " .. (charExists and "✓" or "✗")
+
+	local enemyStatus = Perception.CachedEnemy and "DETECTED" or "None"
+	UI.DebugEnemy.Text = "Enemy: " .. enemyStatus
+	UI.DebugDist.Text = string.format("Dist: %.1f", Perception.CachedDist)
+	UI.DebugAim.Text = string.format("AimConf: %.2f", Agent.AimConfidence)
+	UI.DebugBoredom.Text = string.format("Boredom: %.2f", Agent.BoredomLevel)
+	UI.DebugFitness.Text = string.format("RunFit: %.0f", Agent.CurrentRunFitness)
+end
+
+function UI.DrawNeuralNetwork(agent)
+	if not agent or not agent.CurrentBrain then
+		return
+	end
+
+	local canvas = UI.BrainCanvas
+
+	-- Only show if active
+	if not UI.BrainVisualActive then
+		canvas.Visible = false
+		return
+	end
+
+	canvas.Visible = true
+
+	-- Clear previous drawings (preserve close button)
+	for _, child in ipairs(canvas:GetChildren()) do
+		if child.Name ~= "CloseBtn" then
+			child:Destroy()
+		end
+	end
+
+	local topology = Config.Topology
+	local padding = 50
+	local canvasWidth = canvas.Size.X.Offset
+	local canvasHeight = canvas.Size.Y.Offset - 50
+	local layerSpacing = (canvasWidth - 2 * padding) / (#topology - 1)
+	local maxNeurons = math.max(unpack(topology))
+
+	-- Draw title
+	local titleLabel = Instance.new("TextLabel", canvas)
+	titleLabel.Size = UDim2.new(1, 0, 0, 30)
+	titleLabel.Position = UDim2.new(0, 0, 0, 5)
+	titleLabel.BackgroundTransparency = 1
+	titleLabel.Text = "Neural Network Architecture (Gen " .. agent.CurrentBrain.Generation .. ")"
+	titleLabel.Font = Enum.Font.GothamBold
+	titleLabel.TextColor3 = Color3.fromRGB(100, 200, 255)
+	titleLabel.TextSize = 14
+
+	-- Draw layers and neurons
+	local neuronPositions = {}
+
+	for layerIdx, neuronCount in ipairs(topology) do
+		neuronPositions[layerIdx] = {}
+
+		local x = padding + (layerIdx - 1) * layerSpacing
+		local verticalSpacing = (canvasHeight - 20) / (neuronCount + 1)
+
+		-- Layer label
+		local layerLabel = Instance.new("TextLabel", canvas)
+		layerLabel.Size = UDim2.new(0, 80, 0, 20)
+		layerLabel.Position = UDim2.new(0, x - 40, 1, -25)
+		layerLabel.BackgroundTransparency = 1
+		layerLabel.Text = "L" .. layerIdx .. "(" .. neuronCount .. ")"
+		layerLabel.Font = Enum.Font.RobotoMono
+		layerLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+		layerLabel.TextSize = 9
+
+		for neuronIdx = 1, neuronCount do
+			local y = 40 + (neuronIdx - 0.5) * (canvasHeight - 60) / neuronCount
+
+			-- Draw neuron circle
+			local neuron = Instance.new("Frame", canvas)
+			neuron.Size = UDim2.new(0, 12, 0, 12)
+			neuron.Position = UDim2.new(0, x - 6, 0, y - 6)
+			neuron.BackgroundColor3 = Color3.fromRGB(100, 200, 255)
+			neuron.BorderSizePixel = 1
+			neuron.BorderColor3 = Color3.fromRGB(200, 220, 255)
+			Instance.new("UICorner", neuron).CornerRadius = UDim.new(1, 0)
+
+			neuronPositions[layerIdx][neuronIdx] = { x = x, y = y }
+		end
+
+		-- Draw connections to next layer
+		if layerIdx < #topology then
+			local nextLayerIdx = layerIdx + 1
+			local nextNeuronCount = topology[nextLayerIdx]
+
+			for neuronIdx = 1, neuronCount do
+				local fromX = neuronPositions[layerIdx][neuronIdx].x
+				local fromY = neuronPositions[layerIdx][neuronIdx].y
+
+				for nextNeuronIdx = 1, math.min(nextNeuronCount, 3) do
+					local toX = padding + layerIdx * layerSpacing
+					local toY = 40 + (nextNeuronIdx - 0.5) * (canvasHeight - 60) / nextNeuronCount
+
+					local line = Instance.new("Frame", canvas)
+					local dx = toX - fromX
+					local dy = toY - fromY
+					local dist = math.sqrt(dx * dx + dy * dy)
+					local angle = math.atan2(dy, dx)
+
+					line.Size = UDim2.new(0, dist, 0, 1)
+					line.Position = UDim2.new(0, fromX, 0, fromY)
+					line.BackgroundColor3 = Color3.fromRGB(80, 120, 180)
+					line.BorderSizePixel = 0
+					line.Rotation = math.deg(angle)
+					line.AnchorPoint = Vector2.new(0, 0.5)
+				end
+			end
+		end
+	end
 end
 
 function Agent.SaveBrain()
@@ -1064,6 +1464,25 @@ function Agent.Init()
 			return
 		end
 		local isDead = Agent.CheckDeadStatus()
+
+		-- Detect respawn: was dead, now alive
+		if Agent.IsDead and not isDead then
+			Agent.RespawnBufferTime = 1.5 -- 1.5 second buffer
+			-- Reset all state on respawn
+			Agent.SmoothedOutputs = {}
+			Agent.TargetingYaw = 0
+			Agent.TargetingPitch = 0
+			Agent.AimConfidence = 0
+			Agent.BoredomLevel = 0
+			Agent.PreviousHealth = 100
+			if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+				Agent.LastPosition = LocalPlayer.Character.HumanoidRootPart.Position
+				Agent.LastPos = LocalPlayer.Character.HumanoidRootPart.Position
+			end
+		end
+
+		Agent.IsDead = isDead
+
 		if isDead and activeRun then
 			EndRun()
 		elseif not isDead and not activeRun and LocalPlayer.Character then
@@ -1079,17 +1498,48 @@ function Agent.Init()
 		if not Agent.IsActive then
 			return
 		end
-		Agent.CheckGameState()
 
+		-- Check death status FIRST
 		local isDead = Agent.CheckDeadStatus()
+
+		-- If dead, do NOTHING - let the game handle respawn naturally
 		if isDead then
 			return
 		end
 
-		if not LocalPlayer.Character or not LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
+		-- If we just respawned (was dead, now alive)
+		if Agent.RespawnBufferTime > 0 then
+			Agent.RespawnBufferTime = Agent.RespawnBufferTime - dt
+
+			-- During respawn buffer, try to position player on spawn zone and reduce velocity
+			local char = LocalPlayer.Character
+			if char and char:FindFirstChild("HumanoidRootPart") then
+				local root = char.HumanoidRootPart
+				
+				-- On first respawn frame (>1.4s left), verify and position at spawn zone
+				if Agent.RespawnBufferTime > 1.4 then
+					-- Check if player is in correct respawn zone
+					local inRespawnZone, respawnTeam = Perception.IsInRespawnZone()
+					if not inRespawnZone then
+						-- If not in spawn zone, find nearest and position there
+						local spawnPart, spawnTeam = Perception.FindNearestSpawnZone()
+						if spawnPart then
+							local spawnPos = spawnPart.Position + Vector3.new(0, spawnPart.Size.Y / 2 + 3, 0)
+							root.CFrame = CFrame.new(spawnPos)
+						end
+					end
+				end
+				
+				-- Clamp velocity to prevent flinging
+				root.AssemblyLinearVelocity = root.AssemblyLinearVelocity * 0.5
+			end
 			return
 		end
-		if LocalPlayer.Character.Humanoid.Health <= 0 then
+
+		-- Now it's safe to run game logic
+		Agent.CheckGameState()
+
+		if not LocalPlayer.Character or not LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then
 			return
 		end
 
@@ -1121,6 +1571,10 @@ function Agent.Init()
 					(Agent.BoredomLevel / Config.Hyperparameters.BoredomThreshold) * 100
 				)
 			end
+
+			-- Update debug UI
+			UI.UpdateDebug(Agent)
+			UI.DrawNeuralNetwork(Agent)
 		end
 	end)
 end
